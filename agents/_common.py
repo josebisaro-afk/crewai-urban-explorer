@@ -16,23 +16,21 @@ LANGUAGE_INSTRUCTION = (
 )
 
 
-def get_llm(model: str = "anthropic/claude-opus-5") -> LLM:
+def get_llm(model: str = "anthropic/claude-haiku-4-5-20251001") -> LLM:
     # `temperature` is rejected outright by the Anthropic API for claude-sonnet-5
     # ("`temperature` is deprecated for this model") — confirmed in production
     # via a live crew run, where it made every single agent call fail with a
     # 400 before any content could be generated. Omit it; the model's default
     # sampling is used instead.
     #
-    # claude-sonnet-5 also throws a second, separate error in every one of
-    # this crew's tool-calling loops — "This model does not support assistant
-    # message prefill. The conversation must end with a user message." —
-    # confirmed still present after upgrading litellm to the latest release
-    # (not a stale-litellm issue). Switching only the 21 non-Director agents
-    # to Haiku 4.5 confirmed it too: all 21 completed clean with no prefill
-    # errors, and the run only failed at the very last step, where
-    # director_contenido.py had been deliberately kept on claude-sonnet-5 and
-    # hit the identical error the moment it called send_to_content_ingest —
-    # pinning this squarely on claude-sonnet-5 + tool calls, not litellm
-    # version or the research agents' prompts. Every agent (including the
-    # Director) now uses claude-opus-5 instead.
+    # Both claude-sonnet-5 AND claude-opus-5 throw a second, separate error in
+    # every one of this crew's tool-calling loops — "This model does not
+    # support assistant message prefill. The conversation must end with a
+    # user message." — confirmed on the latest litellm release (not a
+    # stale-litellm issue), and confirmed on both "Claude 5 family" models,
+    # not just Sonnet. Haiku 4.5 is the only model tested that does NOT hit
+    # this: a full run with Haiku on the 21 non-Director agents completed all
+    # of them with zero prefill errors, only failing at the final step where
+    # director_contenido.py was still on Sonnet/Opus. Every agent, including
+    # the Director, now defaults to Haiku 4.5.
     return LLM(model=model, api_key=ANTHROPIC_API_KEY)
