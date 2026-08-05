@@ -17,4 +17,9 @@ LANGUAGE_INSTRUCTION = (
 
 
 def get_llm() -> LLM:
-    return LLM(model="anthropic/claude-sonnet-5", api_key=ANTHROPIC_API_KEY, temperature=0.4)
+    # `temperature` is rejected outright by the Anthropic API for this model
+    # ("`temperature` is deprecated for this model") — confirmed in production
+    # via a live crew run, where it made every single agent call fail with a
+    # 400 before any content could be generated. Omit it; the model's default
+    # sampling is used instead.
+    return LLM(model="anthropic/claude-sonnet-5", api_key=ANTHROPIC_API_KEY)
