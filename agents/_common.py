@@ -16,10 +16,18 @@ LANGUAGE_INSTRUCTION = (
 )
 
 
-def get_llm() -> LLM:
-    # `temperature` is rejected outright by the Anthropic API for this model
+def get_llm(model: str = "anthropic/claude-haiku-4-5-20251001") -> LLM:
+    # `temperature` is rejected outright by the Anthropic API for claude-sonnet-5
     # ("`temperature` is deprecated for this model") — confirmed in production
     # via a live crew run, where it made every single agent call fail with a
     # 400 before any content could be generated. Omit it; the model's default
     # sampling is used instead.
-    return LLM(model="anthropic/claude-sonnet-5", api_key=ANTHROPIC_API_KEY)
+    #
+    # claude-sonnet-5 also throws a second, separate error in every one of
+    # this crew's tool-calling loops — "This model does not support assistant
+    # message prefill. The conversation must end with a user message." —
+    # confirmed still present after upgrading litellm to the latest release,
+    # so it isn't a stale-litellm issue. Default every agent to Haiku 4.5,
+    # which doesn't hit this; director_contenido.py explicitly requests
+    # claude-sonnet-5 for the final output pass instead of using this default.
+    return LLM(model=model, api_key=ANTHROPIC_API_KEY)

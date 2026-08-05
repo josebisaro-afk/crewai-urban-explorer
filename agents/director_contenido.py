@@ -25,7 +25,7 @@ def create_agent() -> Agent:
             "y por qué."
         ),
         tools=[SupabaseIngestTool()],
-        llm=get_llm(),
+        llm=get_llm(model="anthropic/claude-sonnet-5"),
         verbose=True,
         allow_delegation=True,
     )
