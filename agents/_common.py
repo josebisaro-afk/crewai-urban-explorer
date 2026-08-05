@@ -28,9 +28,14 @@ def get_llm(model: str = "anthropic/claude-haiku-4-5-20251001") -> LLM:
     # support assistant message prefill. The conversation must end with a
     # user message." — confirmed on the latest litellm release (not a
     # stale-litellm issue), and confirmed on both "Claude 5 family" models,
-    # not just Sonnet. Haiku 4.5 is the only model tested that does NOT hit
-    # this: a full run with Haiku on the 21 non-Director agents completed all
-    # of them with zero prefill errors, only failing at the final step where
-    # director_contenido.py was still on Sonnet/Opus. Every agent, including
-    # the Director, now defaults to Haiku 4.5.
+    # not just Sonnet. Haiku 4.5 is the only model confirmed clean of this
+    # bug across a full run, which is why it's the default here — used as-is
+    # by the 16 research agents. The 6 writing/QA/director agents
+    # (agente_redactor, personalizador, agente_idioma,
+    # agente_verificacion_datos, agente_calidad_ranking,
+    # director_contenido — all of whom either read a lot of upstream context
+    # or, for the Director, call a tool) each explicitly override this to
+    # claude-3-5-sonnet-20241022 instead, an older Sonnet generation that
+    # predates whatever changed in the Claude 5 family's tool-calling
+    # message-prefill validation.
     return LLM(model=model, api_key=ANTHROPIC_API_KEY)

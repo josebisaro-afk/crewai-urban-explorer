@@ -22,7 +22,7 @@ def create_agent() -> Agent:
             "importancia."
         ),
         tools=[],
-        llm=get_llm(),
+        llm=get_llm(model="anthropic/claude-3-5-sonnet-20241022"),
         verbose=True,
         allow_delegation=False,
     )
