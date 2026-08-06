@@ -1,14 +1,13 @@
-"""Shared LLM instance for all 22 agents — kept in one place so the model
-can be changed once instead of in 22 files. Uses the same ANTHROPIC_API_KEY
-Supabase secret the app's own edge functions (chat, hiking-routes) already
-use, via LiteLLM's "anthropic/<model>" provider prefix that crewai.LLM expects.
+"""Shared LLM instance for every agent across all 5 crews — kept in one
+place so the model can be changed once instead of in ~20 files. Uses the
+same ANTHROPIC_API_KEY Supabase secret the app's own edge functions (chat,
+hiking-routes) already use, via LiteLLM's "anthropic/<model>" provider
+prefix that crewai.LLM expects.
 
-ALL 22 agents currently use the default below (Haiku 4.5) — it's the only
+ALL agents currently use the default below (Haiku 4.5) — it's the only
 model confirmed to work cleanly with this version of CrewAI/litellm. Both
-claude-sonnet-5 and claude-opus-5 were tried for the 6 non-research agents
-(agente_redactor, personalizador, agente_idioma, agente_verificacion_datos,
-agente_calidad_ranking, director_contenido) across several attempts and
-consistently failed:
+claude-sonnet-5 and claude-opus-5 were tried for the old roster's 6
+non-research agents across several attempts and consistently failed:
   - Via crewai.LLM/litellm ("anthropic/claude-sonnet-5" /
     "anthropic/claude-opus-5"): litellm.BadRequestError, "This model does
     not support assistant message prefill. The conversation must end with
@@ -22,10 +21,10 @@ consistently failed:
     adapter to actually go around litellm, which wasn't attempted.
 
 TODO once CrewAI/litellm add real support for claude-sonnet-5/claude-opus-5
-tool-calling: bump the 6 non-research agents back up the cost/quality
-pyramid (sonnet-5 for the 5 writing/QA agents, opus-5 for the Director) in
-one commit — the model string is the only thing that needs to change in
-each of those 6 files, everything else (roles, goals, tools) stays as-is.
+tool-calling: bump the Content and Director crews back up the cost/quality
+pyramid (sonnet-5 for Content's writing/QA agents, opus-5 for the
+Director) — the model string is the only thing that needs to change in
+each agent file, everything else (roles, goals, tools) stays as-is.
 """
 from crewai import LLM
 
