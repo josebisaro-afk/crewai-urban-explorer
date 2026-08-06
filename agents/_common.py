@@ -3,13 +3,29 @@ can be changed once instead of in 22 files. Uses the same ANTHROPIC_API_KEY
 Supabase secret the app's own edge functions (chat, hiking-routes) already
 use, via LiteLLM's "anthropic/<model>" provider prefix that crewai.LLM expects.
 
-Tried and abandoned: passing a raw langchain_anthropic.ChatAnthropic
-instance as Agent(llm=...) to bypass litellm entirely. CrewAI 0.86.0
-doesn't support that — it still funnels the object through its own
-litellm-backed LLM class internally, and ends up passing litellm the
-object's repr() as the "model" string ("LLM Provider NOT provided..."),
-confirmed in a live run. Making that path work for real would need a
-custom crewai.llms.base_llm.BaseLLM adapter, out of scope here.
+ALL 22 agents currently use the default below (Haiku 4.5) — it's the only
+model confirmed to work cleanly with this version of CrewAI/litellm. Both
+claude-sonnet-5 and claude-opus-5 were tried for the 6 non-research agents
+(agente_redactor, personalizador, agente_idioma, agente_verificacion_datos,
+agente_calidad_ranking, director_contenido) across several attempts and
+consistently failed:
+  - Via crewai.LLM/litellm ("anthropic/claude-sonnet-5" /
+    "anthropic/claude-opus-5"): litellm.BadRequestError, "This model does
+    not support assistant message prefill. The conversation must end with
+    a user message." — in every tool-calling loop, on the latest litellm
+    release (1.95.0), so not a stale-litellm issue.
+  - Via langchain_anthropic.ChatAnthropic passed directly as Agent(llm=...)
+    to bypass litellm: doesn't work either — CrewAI 0.86.0 still funnels
+    the object through its own litellm-backed LLM class internally and
+    passes litellm the object's repr() as "model" ("LLM Provider NOT
+    provided..."). Would need a custom crewai.llms.base_llm.BaseLLM
+    adapter to actually go around litellm, which wasn't attempted.
+
+TODO once CrewAI/litellm add real support for claude-sonnet-5/claude-opus-5
+tool-calling: bump the 6 non-research agents back up the cost/quality
+pyramid (sonnet-5 for the 5 writing/QA agents, opus-5 for the Director) in
+one commit — the model string is the only thing that needs to change in
+each of those 6 files, everything else (roles, goals, tools) stays as-is.
 """
 from crewai import LLM
 
@@ -25,15 +41,4 @@ LANGUAGE_INSTRUCTION = (
 
 
 def get_llm(model: str = "anthropic/claude-haiku-4-5-20251001") -> LLM:
-    # Used as-is (Haiku 4.5, no override) by the 16 research agents — do not
-    # change this without re-verifying: `temperature` used to be passed here
-    # and is rejected outright by the Anthropic API for claude-sonnet-5, and
-    # separately, claude-sonnet-5/claude-opus-5 both threw a litellm-side
-    # "assistant message prefill" error in every tool-calling loop. Haiku 4.5
-    # via this litellm-routed path has been confirmed clean of both issues
-    # across two full production runs. The 6 writing/QA/Director agents
-    # (agente_redactor, personalizador, agente_idioma,
-    # agente_verificacion_datos, agente_calidad_ranking,
-    # director_contenido) explicitly override this to
-    # "anthropic/claude-sonnet-5" instead.
     return LLM(model=model, api_key=ANTHROPIC_API_KEY)

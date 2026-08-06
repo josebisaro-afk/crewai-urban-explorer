@@ -20,7 +20,7 @@ def create_agent() -> Agent:
             "en vez de rellenar con una invención. " + LANGUAGE_INSTRUCTION
         ),
         tools=[],
-        llm=get_llm(model="anthropic/claude-sonnet-5"),
+        llm=get_llm(),
         verbose=True,
         allow_delegation=False,
     )

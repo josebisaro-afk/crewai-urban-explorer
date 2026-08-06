@@ -23,7 +23,7 @@ def create_agent() -> Agent:
             "usuarios reales."
         ),
         tools=[OverpassPOITool()],
-        llm=get_llm(model="anthropic/claude-sonnet-5"),
+        llm=get_llm(),
         verbose=True,
         allow_delegation=False,
     )

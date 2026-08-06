@@ -22,7 +22,7 @@ def create_agent() -> Agent:
             "target_language en vez de solo señalarla."
         ),
         tools=[],
-        llm=get_llm(model="anthropic/claude-sonnet-5"),
+        llm=get_llm(),
         verbose=True,
         allow_delegation=False,
     )

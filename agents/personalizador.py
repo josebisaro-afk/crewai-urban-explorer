@@ -24,7 +24,7 @@ def create_agent() -> Agent:
             + LANGUAGE_INSTRUCTION
         ),
         tools=[],
-        llm=get_llm(model="anthropic/claude-sonnet-5"),
+        llm=get_llm(),
         verbose=True,
         allow_delegation=False,
     )
