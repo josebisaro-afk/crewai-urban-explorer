@@ -1,21 +1,17 @@
-"""Shared LLM instances for all 22 agents — kept in one place so the model
+"""Shared LLM instance for all 22 agents — kept in one place so the model
 can be changed once instead of in 22 files. Uses the same ANTHROPIC_API_KEY
 Supabase secret the app's own edge functions (chat, hiking-routes) already
-use.
+use, via LiteLLM's "anthropic/<model>" provider prefix that crewai.LLM expects.
 
-Two different integrations on purpose:
-  - get_llm(): crewai's own LLM class (routes through litellm), used for the
-    16 research agents on Haiku 4.5 — confirmed clean across two full runs.
-  - get_chat_anthropic_llm(): langchain-anthropic's ChatAnthropic, talking to
-    the Anthropic API directly instead of through litellm's routing/message
-    formatting. claude-sonnet-5 and claude-opus-5 both hit a litellm-side
-    "This model does not support assistant message prefill" error in every
-    tool-calling loop (confirmed across multiple live runs, on the latest
-    litellm release, on both models) — going around litellm entirely for
-    these two models is the fix being tried here.
+Tried and abandoned: passing a raw langchain_anthropic.ChatAnthropic
+instance as Agent(llm=...) to bypass litellm entirely. CrewAI 0.86.0
+doesn't support that — it still funnels the object through its own
+litellm-backed LLM class internally, and ends up passing litellm the
+object's repr() as the "model" string ("LLM Provider NOT provided..."),
+confirmed in a live run. Making that path work for real would need a
+custom crewai.llms.base_llm.BaseLLM adapter, out of scope here.
 """
 from crewai import LLM
-from langchain_anthropic import ChatAnthropic
 
 from config import ANTHROPIC_API_KEY
 
@@ -35,15 +31,9 @@ def get_llm(model: str = "anthropic/claude-haiku-4-5-20251001") -> LLM:
     # separately, claude-sonnet-5/claude-opus-5 both threw a litellm-side
     # "assistant message prefill" error in every tool-calling loop. Haiku 4.5
     # via this litellm-routed path has been confirmed clean of both issues
-    # across two full production runs.
+    # across two full production runs. The 6 writing/QA/Director agents
+    # (agente_redactor, personalizador, agente_idioma,
+    # agente_verificacion_datos, agente_calidad_ranking,
+    # director_contenido) explicitly override this to
+    # "anthropic/claude-sonnet-5" instead.
     return LLM(model=model, api_key=ANTHROPIC_API_KEY)
-
-
-def get_chat_anthropic_llm(model: str) -> ChatAnthropic:
-    # For claude-sonnet-5 (Redactor, Personalizador, Agente de Idioma,
-    # Verificación de Datos, Calidad y Ranking) and claude-opus-5 (Director
-    # de Contenido) — bypasses litellm entirely by talking to the Anthropic
-    # API directly through langchain-anthropic, since litellm's own message
-    # formatting was the thing producing the invalid "assistant message
-    # prefill" request for both of these models.
-    return ChatAnthropic(model=model, api_key=ANTHROPIC_API_KEY)
