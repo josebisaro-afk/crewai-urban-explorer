@@ -1,6 +1,6 @@
 from crewai import Agent
 
-from agents._common import get_llm
+from agents._common import get_chat_anthropic_llm
 from tools import SupabaseIngestTool
 
 
@@ -25,7 +25,7 @@ def create_agent() -> Agent:
             "y por qué."
         ),
         tools=[SupabaseIngestTool()],
-        llm=get_llm(model="anthropic/claude-3-5-sonnet-20241022"),
+        llm=get_chat_anthropic_llm("claude-opus-5"),
         verbose=True,
         allow_delegation=True,
     )

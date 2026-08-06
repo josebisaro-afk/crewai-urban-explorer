@@ -1,9 +1,21 @@
-"""Shared LLM instance for all 22 agents — kept in one place so the model
+"""Shared LLM instances for all 22 agents — kept in one place so the model
 can be changed once instead of in 22 files. Uses the same ANTHROPIC_API_KEY
 Supabase secret the app's own edge functions (chat, hiking-routes) already
-use, via LiteLLM's "anthropic/<model>" provider prefix that crewai.LLM expects.
+use.
+
+Two different integrations on purpose:
+  - get_llm(): crewai's own LLM class (routes through litellm), used for the
+    16 research agents on Haiku 4.5 — confirmed clean across two full runs.
+  - get_chat_anthropic_llm(): langchain-anthropic's ChatAnthropic, talking to
+    the Anthropic API directly instead of through litellm's routing/message
+    formatting. claude-sonnet-5 and claude-opus-5 both hit a litellm-side
+    "This model does not support assistant message prefill" error in every
+    tool-calling loop (confirmed across multiple live runs, on the latest
+    litellm release, on both models) — going around litellm entirely for
+    these two models is the fix being tried here.
 """
 from crewai import LLM
+from langchain_anthropic import ChatAnthropic
 
 from config import ANTHROPIC_API_KEY
 
@@ -17,25 +29,21 @@ LANGUAGE_INSTRUCTION = (
 
 
 def get_llm(model: str = "anthropic/claude-haiku-4-5-20251001") -> LLM:
-    # `temperature` is rejected outright by the Anthropic API for claude-sonnet-5
-    # ("`temperature` is deprecated for this model") — confirmed in production
-    # via a live crew run, where it made every single agent call fail with a
-    # 400 before any content could be generated. Omit it; the model's default
-    # sampling is used instead.
-    #
-    # Both claude-sonnet-5 AND claude-opus-5 throw a second, separate error in
-    # every one of this crew's tool-calling loops — "This model does not
-    # support assistant message prefill. The conversation must end with a
-    # user message." — confirmed on the latest litellm release (not a
-    # stale-litellm issue), and confirmed on both "Claude 5 family" models,
-    # not just Sonnet. Haiku 4.5 is the only model confirmed clean of this
-    # bug across a full run, which is why it's the default here — used as-is
-    # by the 16 research agents. The 6 writing/QA/director agents
-    # (agente_redactor, personalizador, agente_idioma,
-    # agente_verificacion_datos, agente_calidad_ranking,
-    # director_contenido — all of whom either read a lot of upstream context
-    # or, for the Director, call a tool) each explicitly override this to
-    # claude-3-5-sonnet-20241022 instead, an older Sonnet generation that
-    # predates whatever changed in the Claude 5 family's tool-calling
-    # message-prefill validation.
+    # Used as-is (Haiku 4.5, no override) by the 16 research agents — do not
+    # change this without re-verifying: `temperature` used to be passed here
+    # and is rejected outright by the Anthropic API for claude-sonnet-5, and
+    # separately, claude-sonnet-5/claude-opus-5 both threw a litellm-side
+    # "assistant message prefill" error in every tool-calling loop. Haiku 4.5
+    # via this litellm-routed path has been confirmed clean of both issues
+    # across two full production runs.
     return LLM(model=model, api_key=ANTHROPIC_API_KEY)
+
+
+def get_chat_anthropic_llm(model: str) -> ChatAnthropic:
+    # For claude-sonnet-5 (Redactor, Personalizador, Agente de Idioma,
+    # Verificación de Datos, Calidad y Ranking) and claude-opus-5 (Director
+    # de Contenido) — bypasses litellm entirely by talking to the Anthropic
+    # API directly through langchain-anthropic, since litellm's own message
+    # formatting was the thing producing the invalid "assistant message
+    # prefill" request for both of these models.
+    return ChatAnthropic(model=model, api_key=ANTHROPIC_API_KEY)

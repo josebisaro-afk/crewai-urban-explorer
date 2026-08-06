@@ -1,6 +1,6 @@
 from crewai import Agent
 
-from agents._common import get_llm
+from agents._common import get_chat_anthropic_llm
 from tools import OverpassPOITool
 
 
@@ -23,7 +23,7 @@ def create_agent() -> Agent:
             "usuarios reales."
         ),
         tools=[OverpassPOITool()],
-        llm=get_llm(model="anthropic/claude-3-5-sonnet-20241022"),
+        llm=get_chat_anthropic_llm("claude-sonnet-5"),
         verbose=True,
         allow_delegation=False,
     )

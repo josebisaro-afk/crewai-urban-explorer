@@ -1,6 +1,6 @@
 from crewai import Agent
 
-from agents._common import LANGUAGE_INSTRUCTION, get_llm
+from agents._common import LANGUAGE_INSTRUCTION, get_chat_anthropic_llm
 
 
 def create_agent() -> Agent:
@@ -24,7 +24,7 @@ def create_agent() -> Agent:
             + LANGUAGE_INSTRUCTION
         ),
         tools=[],
-        llm=get_llm(model="anthropic/claude-3-5-sonnet-20241022"),
+        llm=get_chat_anthropic_llm("claude-sonnet-5"),
         verbose=True,
         allow_delegation=False,
     )
