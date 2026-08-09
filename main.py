@@ -20,6 +20,7 @@ GET  /                — admin/status page.
 """
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from html import escape
 
@@ -56,6 +57,25 @@ run_state_lock = threading.Lock()
 city_status: dict[str, dict] = {}
 city_status_lock = threading.Lock()
 
+# /ingest's real-time entry point used to spawn one raw threading.Thread()
+# per request with no cap — fine for occasional real-time calls, but a
+# burst of requests (e.g. pre-caching many cities) piles up threads that
+# each live for minutes, and eventually the OS refuses to hand out more
+# ("RuntimeError: can't start new thread"), confirmed in production. A
+# bounded pool fixes this: at most MAX_CONCURRENT_INGESTS pipelines run at
+# once: system-wide, everything else submitted waits in the executor's own
+# queue instead of spawning anything or being dropped.
+MAX_CONCURRENT_INGESTS = 2
+_ingest_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_INGESTS, thread_name_prefix="ingest")
+_ingest_lock = threading.Lock()
+_ingest_in_flight = 0
+
+# city_cache statuses that mean "don't start another pipeline run for this
+# city" — see _check_city_cache_gate(). 'pending' is deliberately NOT
+# blocking: it only means "claimed but not yet actually started" (see that
+# function's docstring for the resulting race window).
+_CITY_CACHE_BLOCKING_STATUSES = {"discovery", "enrichment", "content", "complete"}
+
 
 def _log(message: str) -> None:
     entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "message": message}
@@ -71,6 +91,91 @@ def _set_city_status(city: str, crew: str, status: str) -> None:
         city_status[city][crew] = status
         city_status[city]["updated_at"] = datetime.now(timezone.utc).isoformat()
     _log(f"[{city}] {crew}: {status}")
+
+
+def _set_city_cache_status(city: str, status: str, **extra) -> None:
+    """Persists a status transition to Supabase's city_cache table — unlike
+    city_status above (in-memory, this-process-only), this is what the
+    /ingest and /kickoff idempotency gate actually reads, and it survives a
+    restart. Best-effort: a Supabase hiccup here shouldn't take down a
+    pipeline run that's otherwise progressing fine, so this only logs.
+    """
+    payload = {"status": status, **extra}
+    try:
+        supabase.table("city_cache").update(payload).eq("city_name", city).execute()
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to update city_cache status for %s -> %s", city, status)
+
+
+def _check_city_cache_gate(city: str, country: str | None = None) -> tuple[bool, str | None]:
+    """Idempotency gate for /ingest and /kickoff — one Supabase read (and,
+    when allowing the request through, one write) before any pipeline work
+    starts. Zero LLM calls.
+
+    Returns (allowed, blocking_status):
+      - allowed=False, blocking_status=<'discovery'|'enrichment'|'content'
+        |'complete'> — a pipeline for this city is already in flight or
+        already finished; caller should reject with 409.
+      - allowed=True, blocking_status=None — caller may proceed. This
+        claims the row (inserts a fresh 'pending' one, or resets an
+        'error' row back to 'pending') so a later _set_city_cache_status
+        call always has a row to update.
+
+    Known race window: between this claim and _run_pipeline_for_city
+    actually marking the row 'discovery' (its very first step), the row
+    sits at 'pending' — which this gate does not block on — so a second
+    concurrent request for the very same city arriving in that window
+    would also pass through. That window is normally sub-second when a
+    pool worker is free. Closing it fully needs a conditional DB-level
+    upsert (e.g. "UPDATE ... WHERE status NOT IN (...)" or a Postgres
+    function); not attempted here since this pass is meant to be a cheap,
+    zero-LLM-cost hardening step, not a full concurrency rewrite.
+    """
+    try:
+        res = supabase.table("city_cache").select("status").eq("city_name", city).execute()
+        rows = res.data or []
+        existing_status = rows[0]["status"] if rows else None
+    except Exception:  # noqa: BLE001
+        logger.exception("city_cache lookup failed for %s — allowing request through", city)
+        existing_status = None
+
+    if existing_status in _CITY_CACHE_BLOCKING_STATUSES:
+        return False, existing_status
+
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        if existing_status == "error":
+            supabase.table("city_cache").update({
+                "status": "pending", "error_message": None, "triggered_at": now,
+            }).eq("city_name", city).execute()
+        elif existing_status is None:
+            supabase.table("city_cache").insert({
+                "city_name": city, "country": country, "status": "pending", "triggered_at": now,
+            }).execute()
+        # existing_status == "pending" already: nothing to claim/reset.
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to claim city_cache row for %s", city)
+
+    return True, None
+
+
+def _finalize_city_cache(result: dict) -> None:
+    """Writes the final city_cache status once a pipeline run has finished
+    — shared by /ingest (via the thread pool) and /kickoff (sequential
+    loop), so a city claimed by either entry point always gets un-stuck
+    from 'discovery'/'enrichment'/'content' instead of being permanently
+    (and incorrectly) treated as still in flight.
+    """
+    city = result["city"]
+    if result["status"] == "error":
+        message = "; ".join(result.get("errors", [])) or "unknown error"
+        _set_city_cache_status(city, "error", error_message=message[:2000])
+    else:
+        _set_city_cache_status(
+            city, "complete",
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            error_message=None,
+        )
 
 
 def _run_pipeline_for_city(job: CityJob, want_hiker: bool) -> dict:
@@ -113,6 +218,7 @@ def _run_pipeline_for_city(job: CityJob, want_hiker: bool) -> dict:
         _set_city_status(city, "hiker", "skipped")
 
     _set_city_status(city, "discovery", "running")
+    _set_city_cache_status(city, "discovery")
     try:
         discovery_output = DiscoveryCrew(job).kickoff()
         _set_city_status(city, "discovery", "done")
@@ -129,6 +235,7 @@ def _run_pipeline_for_city(job: CityJob, want_hiker: bool) -> dict:
     def run_enrichment_then_content() -> None:
         nonlocal enrichment_result, content_result
         _set_city_status(city, "enrichment", "running")
+        _set_city_cache_status(city, "enrichment")
         try:
             enrichment_result = EnrichmentCrew(job).kickoff(discovery_output)
             _set_city_status(city, "enrichment", "done")
@@ -138,6 +245,7 @@ def _run_pipeline_for_city(job: CityJob, want_hiker: bool) -> dict:
             logger.exception("EnrichmentCrew failed for %s", city)
 
         _set_city_status(city, "content", "running")
+        _set_city_cache_status(city, "content")
         try:
             content_result = ContentCrew(job).kickoff(discovery_output, enrichment_result)
             _set_city_status(city, "content", "done")
@@ -182,6 +290,7 @@ def _run_multi_city_in_background(cities: list[CityJob], trigger: str) -> None:
     try:
         for job in cities:
             result = _run_pipeline_for_city(job, want_hiker=False)
+            _finalize_city_cache(result)
             if result["status"] == "error":
                 failed.append(result)
         with run_state_lock:
@@ -212,17 +321,51 @@ async def kickoff(request: Request, authorization: str = Header(default="")):
     if not isinstance(raw_cities, list) or not raw_cities:
         raise HTTPException(status_code=400, detail="cities must be a non-empty array")
 
-    cities = [CityJob(**c) for c in raw_cities]
+    candidate_cities = [CityJob(**c) for c in raw_cities]
 
     with run_state_lock:
         already_running = run_state["status"] == "running"
     if already_running:
         return JSONResponse(status_code=409, content={"error": "a kickoff is already running"})
 
+    # Same idempotency gate as /ingest, applied per-city — a daily cron run
+    # shouldn't re-process a city that's already complete or mid-flight
+    # from some other trigger just because it's in this batch.
+    cities: list[CityJob] = []
+    skipped: list[dict] = []
+    for candidate in candidate_cities:
+        allowed, blocking_status = _check_city_cache_gate(candidate.city, candidate.country)
+        if allowed:
+            cities.append(candidate)
+        else:
+            skipped.append({"city": candidate.city, "status": blocking_status})
+
+    if not cities:
+        return JSONResponse(status_code=202, content={"accepted": True, "city_count": 0, "skipped": skipped})
+
     thread = threading.Thread(target=_run_multi_city_in_background, args=(cities, trigger), daemon=True)
     thread.start()
 
-    return JSONResponse(status_code=202, content={"accepted": True, "city_count": len(cities)})
+    return JSONResponse(status_code=202, content={"accepted": True, "city_count": len(cities), "skipped": skipped})
+
+
+def _run_ingest_job(job: CityJob, want_hiker: bool) -> None:
+    """Executed on the bounded _ingest_executor pool — never a raw
+    threading.Thread() (that's what caused RuntimeError: can't start new
+    thread under load). Always finalizes city_cache, even on an exception
+    this function itself didn't anticipate, so a city never gets stuck
+    claimed forever.
+    """
+    global _ingest_in_flight
+    try:
+        result = _run_pipeline_for_city(job, want_hiker)
+        _finalize_city_cache(result)
+    except Exception:  # noqa: BLE001 — pool worker must never die silently
+        logger.exception("Unhandled error running pipeline for %s", job.city)
+        _set_city_cache_status(job.city, "error", error_message="unhandled worker exception")
+    finally:
+        with _ingest_lock:
+            _ingest_in_flight = max(0, _ingest_in_flight - 1)
 
 
 @app.post("/ingest")
@@ -231,7 +374,14 @@ async def ingest(request: Request, authorization: str = Header(default="")):
     moment a user opens a city with no content yet. Responds 202
     immediately; poll GET /status/{city} to see progress and what's
     already available to show (Discovery's POIs land first, usually
-    within under a minute)."""
+    within under a minute).
+
+    Idempotency: rejects with 409 if city_cache already shows this city as
+    in-flight or complete (see _check_city_cache_gate). Concurrency: runs
+    on a bounded pool (MAX_CONCURRENT_INGESTS) instead of an unbounded raw
+    thread per request — extra requests queue inside the pool rather than
+    spawning anything or failing.
+    """
     _check_auth(authorization)
 
     body = await request.json()
@@ -241,10 +391,23 @@ async def ingest(request: Request, authorization: str = Header(default="")):
     job = CityJob(**{k: v for k, v in body.items() if k != "mode"})
     want_hiker = body.get("mode") == "hiker"
 
-    thread = threading.Thread(target=_run_pipeline_for_city, args=(job, want_hiker), daemon=True)
-    thread.start()
+    allowed, blocking_status = _check_city_cache_gate(job.city, job.country)
+    if not allowed:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "already processing or complete", "city": job.city, "status": blocking_status},
+        )
 
-    return JSONResponse(status_code=202, content={"accepted": True, "city": job.city, "hiker": want_hiker})
+    global _ingest_in_flight
+    with _ingest_lock:
+        queued = _ingest_in_flight >= MAX_CONCURRENT_INGESTS
+        _ingest_in_flight += 1
+    _ingest_executor.submit(_run_ingest_job, job, want_hiker)
+
+    return JSONResponse(
+        status_code=202,
+        content={"accepted": True, "city": job.city, "hiker": want_hiker, "queued": queued},
+    )
 
 
 @app.get("/status/{city_id}")
