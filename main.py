@@ -18,12 +18,15 @@ GET  /status/{city_id} — which crews have finished for a city (in-memory,
                         this-process-only) + live Supabase content counts.
 GET  /                — admin/status page.
 """
+import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from html import escape
+from urllib.parse import quote
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -97,14 +100,82 @@ def _set_city_cache_status(city: str, status: str, **extra) -> None:
     """Persists a status transition to Supabase's city_cache table — unlike
     city_status above (in-memory, this-process-only), this is what the
     /ingest and /kickoff idempotency gate actually reads, and it survives a
-    restart. Best-effort: a Supabase hiccup here shouldn't take down a
-    pipeline run that's otherwise progressing fine, so this only logs.
+    restart. Upsert (not a plain update) so this is safe to call even if
+    the row doesn't exist yet for some reason — an update would silently
+    no-op on a missing row instead of creating it. Best-effort: a Supabase
+    hiccup here shouldn't take down a pipeline run that's otherwise
+    progressing fine, so this only logs.
     """
-    payload = {"status": status, **extra}
+    payload = {"city_name": city, "status": status, **extra}
     try:
-        supabase.table("city_cache").update(payload).eq("city_name", city).execute()
+        supabase.table("city_cache").upsert(payload, on_conflict="city_name").execute()
     except Exception:  # noqa: BLE001
         logger.exception("Failed to update city_cache status for %s -> %s", city, status)
+
+
+def _count_table_rows(table: str, city: str) -> int:
+    """Live COUNT(*) for one of the content tables, scoped to a city — used
+    both for the Discovery-skip check and for recording poi_count/
+    event_count/business_count into city_cache."""
+    try:
+        res = supabase.table(table).select("id", count="exact").eq("city", city).execute()
+        return res.count or 0
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to count %s for %s", table, city)
+        return 0
+
+
+def _fetch_existing_content_as_discovery_output(city: str) -> dict:
+    """Builds a DiscoveryCrew-shaped output dict from what's already in
+    Supabase for this city — used when Discovery (and Enrichment) are
+    skipped because poi-discovery already populated it, so ContentCrew's
+    Redactor task still gets real material to work from (see
+    tasks/content/redactor_contenido.py, which just dumps whatever keys/
+    values it's given into its prompt — the exact shape doesn't matter,
+    only that it's genuine data, not fabricated).
+    """
+    output: dict[str, str] = {}
+    for table, key in (("points_of_interest", "pois"), ("events", "events"), ("businesses", "businesses")):
+        try:
+            res = supabase.table(table).select("*").eq("city", city).execute()
+            output[key] = json.dumps(res.data or [], default=str)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to fetch existing %s for %s", table, city)
+            output[key] = "[]"
+    return output
+
+
+def _fetch_wikipedia_summary_and_cache(city: str) -> None:
+    """Best-effort, non-blocking Wikipedia summary fetch — fired right when
+    /ingest accepts a city, independent of (and much faster than) the
+    CrewAI pipeline, so the app's loading screen has real content to show
+    within a second or two instead of waiting on agents. Never raises: a
+    miss (no matching English Wikipedia article, network hiccup, etc.)
+    just means city_cache's wikipedia_* fields stay empty, which the
+    client already needs to handle for any city without a match.
+    """
+    try:
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(city)}"
+        resp = httpx.get(
+            url, timeout=5.0,
+            headers={"User-Agent": "UrbanExplorerApp/1.0 (contact@urbanexplorer.app)"},
+        )
+        if resp.status_code != 200:
+            return
+        data = resp.json()
+        extract = data.get("extract")
+        thumbnail_url = (data.get("thumbnail") or {}).get("source")
+        if not extract and not thumbnail_url:
+            return
+        payload = {"city_name": city}
+        if extract:
+            payload["wikipedia_summary"] = extract
+        if thumbnail_url:
+            payload["wikipedia_image_url"] = thumbnail_url
+        supabase.table("city_cache").upsert(payload, on_conflict="city_name").execute()
+        _log(f"[{city}] Wikipedia summary cached")
+    except Exception:  # noqa: BLE001
+        logger.exception("Wikipedia summary fetch failed for %s", city)
 
 
 def _check_city_cache_gate(city: str, country: str | None = None) -> tuple[bool, str | None]:
@@ -174,6 +245,9 @@ def _finalize_city_cache(result: dict) -> None:
         _set_city_cache_status(
             city, "complete",
             completed_at=datetime.now(timezone.utc).isoformat(),
+            poi_count=_count_table_rows("points_of_interest", city),
+            event_count=_count_table_rows("events", city),
+            business_count=_count_table_rows("businesses", city),
             error_message=None,
         )
 
@@ -198,6 +272,7 @@ def _run_pipeline_for_city(job: CityJob, want_hiker: bool) -> dict:
     city = job.city
     errors: list[str] = []
     hiker_result = {"routes": ""}
+    content_result: dict = {}
 
     def run_hiker() -> None:
         nonlocal hiker_result
@@ -217,46 +292,84 @@ def _run_pipeline_for_city(job: CityJob, want_hiker: bool) -> dict:
     else:
         _set_city_status(city, "hiker", "skipped")
 
-    _set_city_status(city, "discovery", "running")
-    _set_city_cache_status(city, "discovery")
-    try:
-        discovery_output = DiscoveryCrew(job).kickoff()
-        _set_city_status(city, "discovery", "done")
-    except Exception as exc:  # noqa: BLE001
-        _set_city_status(city, "discovery", "error")
-        logger.exception("DiscoveryCrew failed for %s", city)
-        if hiker_thread:
-            hiker_thread.join()
-        return {"city": city, "status": "error", "errors": [f"discovery: {exc}"], "director_report": ""}
+    # Option B: poi-discovery (Wikipedia/Google Places, triggered from the
+    # app) is the primary content engine. If it already populated this
+    # city, running DiscoveryCrew would just re-research what's already
+    # there and EnrichmentCrew would re-describe it — burning Anthropic
+    # tokens for zero new data. Skip both, go straight to ContentCrew,
+    # which narrates/polishes the existing rows instead of discovering
+    # from scratch (see _fetch_existing_content_as_discovery_output).
+    existing_poi_count = _count_table_rows("points_of_interest", city)
 
-    enrichment_result: dict = {}
-    content_result: dict = {}
+    if existing_poi_count > 0:
+        _log(f"[{city}] {existing_poi_count} POIs already exist — skipping Discovery+Enrichment, going straight to Content")
+        _set_city_status(city, "discovery", "skipped")
+        _set_city_status(city, "enrichment", "skipped")
+        _set_city_cache_status(
+            city, "content",
+            content_at=datetime.now(timezone.utc).isoformat(),
+            poi_count=existing_poi_count,
+        )
+        discovery_output = _fetch_existing_content_as_discovery_output(city)
+        enrichment_output: dict = {}
 
-    def run_enrichment_then_content() -> None:
-        nonlocal enrichment_result, content_result
-        _set_city_status(city, "enrichment", "running")
-        _set_city_cache_status(city, "enrichment")
+        def run_content() -> None:
+            nonlocal content_result
+            _set_city_status(city, "content", "running")
+            try:
+                content_result = ContentCrew(job).kickoff(discovery_output, enrichment_output)
+                _set_city_status(city, "content", "done")
+            except Exception as exc:  # noqa: BLE001
+                _set_city_status(city, "content", "error")
+                errors.append(f"content: {exc}")
+                logger.exception("ContentCrew failed for %s", city)
+
+        content_thread = threading.Thread(target=run_content, daemon=True)
+        content_thread.start()
+        content_thread.join()
+
+    else:
+        _set_city_status(city, "discovery", "running")
+        _set_city_cache_status(city, "discovery", discovery_at=datetime.now(timezone.utc).isoformat())
         try:
-            enrichment_result = EnrichmentCrew(job).kickoff(discovery_output)
-            _set_city_status(city, "enrichment", "done")
+            discovery_output = DiscoveryCrew(job).kickoff()
+            _set_city_status(city, "discovery", "done")
+            _set_city_cache_status(city, "discovery", poi_count=_count_table_rows("points_of_interest", city))
         except Exception as exc:  # noqa: BLE001
-            _set_city_status(city, "enrichment", "error")
-            errors.append(f"enrichment: {exc}")
-            logger.exception("EnrichmentCrew failed for %s", city)
+            _set_city_status(city, "discovery", "error")
+            logger.exception("DiscoveryCrew failed for %s", city)
+            if hiker_thread:
+                hiker_thread.join()
+            return {"city": city, "status": "error", "errors": [f"discovery: {exc}"], "director_report": ""}
 
-        _set_city_status(city, "content", "running")
-        _set_city_cache_status(city, "content")
-        try:
-            content_result = ContentCrew(job).kickoff(discovery_output, enrichment_result)
-            _set_city_status(city, "content", "done")
-        except Exception as exc:  # noqa: BLE001
-            _set_city_status(city, "content", "error")
-            errors.append(f"content: {exc}")
-            logger.exception("ContentCrew failed for %s", city)
+        enrichment_result: dict = {}
 
-    ec_thread = threading.Thread(target=run_enrichment_then_content, daemon=True)
-    ec_thread.start()
-    ec_thread.join()
+        def run_enrichment_then_content() -> None:
+            nonlocal enrichment_result, content_result
+            _set_city_status(city, "enrichment", "running")
+            _set_city_cache_status(city, "enrichment", enrichment_at=datetime.now(timezone.utc).isoformat())
+            try:
+                enrichment_result = EnrichmentCrew(job).kickoff(discovery_output)
+                _set_city_status(city, "enrichment", "done")
+            except Exception as exc:  # noqa: BLE001
+                _set_city_status(city, "enrichment", "error")
+                errors.append(f"enrichment: {exc}")
+                logger.exception("EnrichmentCrew failed for %s", city)
+
+            _set_city_status(city, "content", "running")
+            _set_city_cache_status(city, "content", content_at=datetime.now(timezone.utc).isoformat())
+            try:
+                content_result = ContentCrew(job).kickoff(discovery_output, enrichment_result)
+                _set_city_status(city, "content", "done")
+            except Exception as exc:  # noqa: BLE001
+                _set_city_status(city, "content", "error")
+                errors.append(f"content: {exc}")
+                logger.exception("ContentCrew failed for %s", city)
+
+        ec_thread = threading.Thread(target=run_enrichment_then_content, daemon=True)
+        ec_thread.start()
+        ec_thread.join()
+
     if hiker_thread:
         hiker_thread.join()
 
@@ -350,6 +463,9 @@ async def kickoff(request: Request, authorization: str = Header(default="")):
         allowed, blocking_status = _check_city_cache_gate(candidate.city, candidate.country)
         if allowed:
             cities.append(candidate)
+            threading.Thread(
+                target=_fetch_wikipedia_summary_and_cache, args=(candidate.city,), daemon=True,
+            ).start()
         else:
             skipped.append({"city": candidate.city, "status": blocking_status})
 
@@ -410,6 +526,13 @@ async def ingest(request: Request, authorization: str = Header(default="")):
             status_code=409,
             content={"error": "already processing or complete", "city": job.city, "status": blocking_status},
         )
+
+    # Fire-and-forget — gives the app's loading screen real content within
+    # a second or two, independent of (and much faster than) the pipeline
+    # itself. A plain daemon thread is fine here: unlike the old per-request
+    # pipeline thread, this one call finishes in a few seconds at most, so
+    # it can't accumulate into the same thread-exhaustion problem.
+    threading.Thread(target=_fetch_wikipedia_summary_and_cache, args=(job.city,), daemon=True).start()
 
     global _ingest_in_flight
     with _ingest_lock:
