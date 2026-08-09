@@ -311,11 +311,24 @@ def _check_auth(authorization: str) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+async def _read_json_body(request: Request) -> dict:
+    """request.json() raises a raw UnicodeDecodeError/JSONDecodeError on a
+    malformed body, which FastAPI turns into an unstyled 500 with a full
+    traceback leaked to the caller — found while testing the idempotency
+    gate above (a non-UTF-8 body byte from a shell encoding quirk, not
+    anything the real app client sends, but the endpoint should still
+    respond with a normal 400 instead of crashing-looking output)."""
+    try:
+        return await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}") from exc
+
+
 @app.post("/kickoff")
 async def kickoff(request: Request, authorization: str = Header(default="")):
     _check_auth(authorization)
 
-    body = await request.json()
+    body = await _read_json_body(request)
     trigger = body.get("trigger", "manual")
     raw_cities = body.get("cities", [])
     if not isinstance(raw_cities, list) or not raw_cities:
@@ -384,7 +397,7 @@ async def ingest(request: Request, authorization: str = Header(default="")):
     """
     _check_auth(authorization)
 
-    body = await request.json()
+    body = await _read_json_body(request)
     if "city" not in body:
         raise HTTPException(status_code=400, detail="city is required")
 
