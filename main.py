@@ -21,6 +21,7 @@ GET  /                — admin/status page.
 import json
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from html import escape
@@ -68,10 +69,68 @@ city_status_lock = threading.Lock()
 # bounded pool fixes this: at most MAX_CONCURRENT_INGESTS pipelines run at
 # once: system-wide, everything else submitted waits in the executor's own
 # queue instead of spawning anything or being dropped.
+#
+# That bound caps *concurrent* entry, but doesn't stop threads from piling
+# up *cumulatively* over many sequential cities: CrewAI (and litellm,
+# opentelemetry, requests' connection pools underneath it) spawn their own
+# internal daemon threads during kickoff() that we have no handle to and
+# that don't always exit promptly when kickoff() returns. Confirmed in
+# production: a batch of 40 cities got through ~10 cleanly, then every
+# subsequent city failed — 18 with an in-process "unhandled worker
+# exception" (the OS finally refusing new threads mid-pipeline), then the
+# remaining cities failing at the HTTP layer itself once the process-wide
+# thread count was exhausted enough that even accepting a new request
+# could fail.
+#
+# ProcessPoolExecutor would isolate each city's thread usage in its own OS
+# process, which is the textbook fix — deliberately NOT used here though:
+# city_status/run_state (this module's in-memory pipeline-progress state,
+# read by GET /status and GET /) live in this process's memory and would
+# silently stop updating from a worker in a different process; and this is
+# a long-running FastAPI process with its own threads and an already-
+# instantiated Supabase/httpx client (open connections/thread state), so
+# fork()-ing a worker off of it while it's live is a well-known source of
+# hangs and corrupted connections. Falling back to the documented
+# alternative instead: reap what's reapable and give the OS a moment to
+# reclaim the rest between cities (see _reap_leaked_threads below).
 MAX_CONCURRENT_INGESTS = 2
 _ingest_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_INGESTS, thread_name_prefix="ingest")
 _ingest_lock = threading.Lock()
 _ingest_in_flight = 0
+
+# Seconds to pause after each city (inside the try/finally below) before a
+# pool worker — or the sequential /kickoff loop — picks up the next one,
+# giving the OS a window to actually reclaim thread resources rather than
+# racing straight into the next city's kickoff() while leaked threads from
+# the previous one are still unwinding.
+POST_CITY_COOLDOWN_SECONDS = 3
+# Bounded per-thread join — these are threads we don't own (CrewAI's own
+# internals), so a thread still alive after this long is treated as
+# genuinely leaked for this city rather than blocked waiting to reap it.
+THREAD_REAP_JOIN_TIMEOUT_SECONDS = 0.5
+
+
+def _reap_leaked_threads(city: str) -> None:
+    """Best-effort cleanup for the thread leak described above. This can't
+    stop CrewAI/litellm/etc. from spawning threads we don't control, and it
+    can't force a genuinely stuck thread to exit — daemon threads die with
+    the process regardless. What it does do: give any daemon thread that's
+    already finished (or finishes within the short join window) a chance
+    to be reaped by the interpreter *now*, right after this city, instead
+    of sitting alive until the process happens to garbage-collect it —
+    and log how many are still alive afterward, so a growing count is
+    visible in Railway logs instead of silently building up until the next
+    "can't start new thread" crash.
+    """
+    current = threading.current_thread()
+    candidates = [
+        t for t in threading.enumerate()
+        if t is not current and t is not threading.main_thread() and t.daemon
+    ]
+    for t in candidates:
+        t.join(timeout=THREAD_REAP_JOIN_TIMEOUT_SECONDS)
+    still_alive = sum(1 for t in candidates if t.is_alive())
+    _log(f"[{city}] thread reap: {len(candidates)} daemon thread(s) seen, {still_alive} still alive")
 
 # city_cache statuses that mean "don't start another pipeline run for this
 # city" — see _check_city_cache_gate(). 'pending' is deliberately NOT
@@ -402,10 +461,18 @@ def _run_multi_city_in_background(cities: list[CityJob], trigger: str) -> None:
     failed = []
     try:
         for job in cities:
-            result = _run_pipeline_for_city(job, want_hiker=False)
-            _finalize_city_cache(result)
-            if result["status"] == "error":
-                failed.append(result)
+            try:
+                result = _run_pipeline_for_city(job, want_hiker=False)
+                _finalize_city_cache(result)
+                if result["status"] == "error":
+                    failed.append(result)
+            finally:
+                # Same cumulative thread-leak concern as _run_ingest_job —
+                # /kickoff runs every city sequentially in this one loop,
+                # so without this the leak has an even tighter, unbroken
+                # window to accumulate in than /ingest's pool workers do.
+                _reap_leaked_threads(job.city)
+                time.sleep(POST_CITY_COOLDOWN_SECONDS)
         with run_state_lock:
             run_state["status"] = "error" if failed else "done"
             run_state["last_finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -484,6 +551,13 @@ def _run_ingest_job(job: CityJob, want_hiker: bool) -> None:
     thread under load). Always finalizes city_cache, even on an exception
     this function itself didn't anticipate, so a city never gets stuck
     claimed forever.
+
+    The finally block also reaps whatever leaked CrewAI/litellm threads it
+    can and pauses before returning — see _reap_leaked_threads and
+    MAX_CONCURRENT_INGESTS's docstring above. This runs on a long-lived
+    pool worker thread that gets reused for the *next* submitted city, so
+    doing this here, before returning, is what actually happens "before
+    starting the next city" for that worker.
     """
     global _ingest_in_flight
     try:
@@ -493,8 +567,12 @@ def _run_ingest_job(job: CityJob, want_hiker: bool) -> None:
         logger.exception("Unhandled error running pipeline for %s", job.city)
         _set_city_cache_status(job.city, "error", error_message="unhandled worker exception")
     finally:
-        with _ingest_lock:
-            _ingest_in_flight = max(0, _ingest_in_flight - 1)
+        try:
+            _reap_leaked_threads(job.city)
+            time.sleep(POST_CITY_COOLDOWN_SECONDS)
+        finally:
+            with _ingest_lock:
+                _ingest_in_flight = max(0, _ingest_in_flight - 1)
 
 
 @app.post("/ingest")
