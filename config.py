@@ -3,14 +3,16 @@ import os
 
 from supabase import create_client, Client
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+# .strip(): una clave pegada a mano en GitHub puede traer espacios o saltos de línea.
+SUPABASE_URL = os.environ["SUPABASE_URL"].strip()
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip()
 # En GitHub Actions solo hay dos secretos (service role + Anthropic): si no
 # hay secreto propio de ingesta, agent-content-ingest acepta la service role.
 CREWAI_INGEST_SECRET = os.environ.get("CREWAI_INGEST_SECRET") or SUPABASE_SERVICE_ROLE_KEY
 # Solo lo usa el servidor FastAPI (main.py); el job de GitHub no lo necesita.
 CREWAI_KICKOFF_TOKEN = os.environ.get("CREWAI_KICKOFF_TOKEN", "")
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"].strip()
+os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY  # litellm lo lee del entorno
 
 AGENT_CONTENT_INGEST_URL = f"{SUPABASE_URL}/functions/v1/agent-content-ingest"
 

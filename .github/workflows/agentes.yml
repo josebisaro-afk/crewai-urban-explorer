@@ -49,9 +49,27 @@ jobs:
             exit 1
           fi
 
+      - name: Revisar formato de las claves (sin mostrarlas)
+        run: |
+          python3 - <<'PY'
+          import os, json, base64
+          k = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+          s = k.strip()
+          print("Supabase: largo", len(k), "| espacios o saltos sobrantes:", k != s, "| partes:", len(s.split(".")))
+          try:
+              p = s.split(".")[1]; p += "=" * (-len(p) % 4)
+              claims = json.loads(base64.urlsafe_b64decode(p))
+              print("Supabase: rol =", claims.get("role"), "| proyecto =", claims.get("ref"))
+          except Exception as e:
+              print("Supabase: no parece una clave JWT:", type(e).__name__)
+          a = os.environ["ANTHROPIC_API_KEY"]
+          print("Anthropic: largo", len(a), "| empieza bien:", a.strip().startswith("sk-ant-"), "| espacios sobrantes:", a != a.strip())
+          PY
+
       - name: ¿Hay ciudades pendientes?
         id: cola
         run: |
+          SUPABASE_SERVICE_ROLE_KEY="$(printf '%s' "$SUPABASE_SERVICE_ROLE_KEY" | tr -d '[:space:]')"
           if [ -n "$INPUT_CITY" ]; then echo "hay=1" >> "$GITHUB_OUTPUT"; exit 0; fi
           n=$(curl -sS --fail -X POST "$SUPABASE_URL/rest/v1/rpc/agent_next_cities" \
                 -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
