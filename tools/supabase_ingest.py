@@ -13,6 +13,7 @@ chunks larger batches accordingly and reports per-item failures back to the
 agent instead of swallowing them, since the edge function itself returns
 200 even when individual items fail validation.
 """
+import math
 import time
 from typing import Literal, Type
 
@@ -20,7 +21,7 @@ import httpx
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 
-from config import AGENT_CONTENT_INGEST_URL, CREWAI_INGEST_SECRET, VALID_CATEGORIES
+from config import AGENT_CONTENT_INGEST_URL, CREWAI_INGEST_SECRET, VALID_CATEGORIES, supabase
 
 MAX_ITEMS_PER_REQUEST = 50
 FOOD_CATEGORIES = {"restaurant", "bar", "gastronomy"}
@@ -57,7 +58,43 @@ class SupabaseIngestTool(BaseTool):
     )
     args_schema: Type[BaseModel] = SupabaseIngestInput
 
+    @staticmethod
+    def _merge_with_existing_pois(items: list[dict]) -> list[dict]:
+        """Un lugar a menos de 80 m de otro ya guardado es el mismo sitio
+        (p. ej. "Catedral de Santa Isabel" y "Catedral de Santa Isabel
+        (Košice)"): se usa el nombre guardado para que sea una actualización
+        y no un duplicado."""
+        cities = {it.get("city") for it in items if it.get("city")}
+        existing: list[dict] = []
+        for city in cities:
+            try:
+                res = supabase.table("points_of_interest").select("name,lat,lng").eq("city", city).execute()
+                existing += [dict(r, city=city) for r in (res.data or [])]
+            except Exception:  # noqa: BLE001
+                return items
+        def dist_m(a_lat, a_lng, b_lat, b_lng):
+            k = math.pi / 180
+            x = (b_lng - a_lng) * k * math.cos((a_lat + b_lat) * k / 2)
+            y = (b_lat - a_lat) * k
+            return 6371000 * math.hypot(x, y)
+        for it in items:
+            lat, lng = it.get("lat"), it.get("lng")
+            if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+                continue
+            best = None
+            for ex in existing:
+                if ex["city"] != it.get("city") or ex.get("lat") is None or ex.get("lng") is None:
+                    continue
+                d = dist_m(lat, lng, float(ex["lat"]), float(ex["lng"]))
+                if d <= 80 and (best is None or d < best[0]):
+                    best = (d, ex["name"])
+            if best and best[1] != it.get("name"):
+                it["name"] = best[1]
+        return items
+
     def _run(self, type: str, items: list[dict], location: str = "") -> str:
+        if type == "poi":
+            items = self._merge_with_existing_pois(items)
         unknown_categories = {
             item.get("category") for item in items
             if item.get("category") not in VALID_CATEGORIES
