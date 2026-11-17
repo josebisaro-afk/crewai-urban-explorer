@@ -87,14 +87,25 @@ def _claim(city: str, country: str | None) -> None:
     )
 
 
+def _business_total(city: str) -> int:
+    return main._count_table_rows("businesses", city)
+
+
 def run(jobs: list[CityJob], want_hiker: bool) -> int:
     failed = 0
     for job in jobs:
+        had_business = _business_total(job.city) > 0
         job.country = _country_for(job)
         logger.info("=== Agentes trabajando en %s (%s) ===", job.city, job.country or "país desconocido")
         _claim(job.city, job.country)
         try:
             result = main._run_pipeline_for_city(job, want_hiker)
+            # Ciudad sin negocios que sigue sin negocios: los agentes no
+            # lograron guardar nada. Se marca error para que la cola lo
+            # reintente (antes quedaba "complete" vacía durante 30 días).
+            if result["status"] != "error" and not had_business and _business_total(job.city) == 0:
+                result["status"] = "error"
+                result.setdefault("errors", []).append("los agentes terminaron pero no se guardó nada nuevo")
             main._finalize_city_cache(result)
             logger.info("Resultado %s: %s %s", job.city, result["status"], result.get("errors"))
             logger.info("Informe del Director:\n%s", result.get("director_report", "")[:4000])
