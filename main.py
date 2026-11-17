@@ -20,6 +20,7 @@ GET  /                — admin/status page.
 """
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -182,6 +183,41 @@ def _count_table_rows(table: str, city: str) -> int:
     except Exception:  # noqa: BLE001
         logger.exception("Failed to count %s for %s", table, city)
         return 0
+
+
+def _parse_json_list(raw: str) -> list[dict]:
+    """Saca la lista JSON de la respuesta de un agente (con o sin ```json)."""
+    if not raw:
+        return []
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(raw).strip())
+    start, end = text.find("["), text.rfind("]")
+    if start < 0 or end <= start:
+        return []
+    try:
+        data = json.loads(text[start:end + 1])
+    except ValueError:
+        return []
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+
+
+def _ingest_direct(job: CityJob, kind: str, raw: str) -> str:
+    """Guarda directamente lo que encontraron los buscadores (datos reales de
+    OpenStreetMap / Wikipedia), sin depender de que el Director lo reenvíe.
+    El Director después solo mejora textos de lo que ya está guardado."""
+    from config import VALID_CATEGORIES
+    from tools.supabase_ingest import SupabaseIngestTool
+
+    items = []
+    for it in _parse_json_list(raw):
+        if it.get("category") not in VALID_CATEGORIES:
+            continue
+        it["city"] = job.city
+        if job.country and not it.get("country"):
+            it["country"] = job.country
+        items.append(it)
+    if not items:
+        return f"[{job.city}] {kind}: nada que guardar"
+    return SupabaseIngestTool()._run(kind, items, job.city)
 
 
 def _fetch_existing_content_as_discovery_output(city: str) -> dict:
@@ -371,14 +407,16 @@ def _run_pipeline_for_city(job: CityJob, want_hiker: bool) -> dict:
         )
         discovery_output = _fetch_existing_content_as_discovery_output(city)
         enrichment_output: dict = {}
-        # Aunque haya lugares, faltan restaurantes y agenda: los buscadores
-        # de negocios y de eventos trabajan igual (datos reales de
-        # OpenStreetMap / fuentes con fecha), sin rehacer los lugares.
+        # Aunque haya lugares, faltan restaurantes: el buscador de negocios
+        # trabaja igual (datos reales de OpenStreetMap) y lo que encuentra se
+        # guarda directamente. La agenda en vivo la cubre la función
+        # live-events (búsqueda web con fecha y fuente); aquí no se inventan
+        # eventos con Wikipedia.
         _set_city_status(city, "discovery", "running")
         try:
-            fresh = DiscoveryCrew(job).kickoff(only=("events", "businesses"))
-            discovery_output["new_events"] = fresh.get("events", "[]")
+            fresh = DiscoveryCrew(job).kickoff(only=("businesses",))
             discovery_output["new_businesses"] = fresh.get("businesses", "[]")
+            _log(_ingest_direct(job, "business", fresh.get("businesses", "")))
             _set_city_status(city, "discovery", "done")
         except Exception as exc:  # noqa: BLE001
             _set_city_status(city, "discovery", "error")
@@ -405,6 +443,10 @@ def _run_pipeline_for_city(job: CityJob, want_hiker: bool) -> dict:
         _set_city_cache_status(city, "discovery", discovery_at=datetime.now(timezone.utc).isoformat())
         try:
             discovery_output = DiscoveryCrew(job).kickoff()
+            # Lugares y negocios reales se guardan ya; el resto del equipo
+            # solo mejora descripciones.
+            _log(_ingest_direct(job, "poi", discovery_output.get("pois", "")))
+            _log(_ingest_direct(job, "business", discovery_output.get("businesses", "")))
             _set_city_status(city, "discovery", "done")
             _set_city_cache_status(city, "discovery", poi_count=_count_table_rows("points_of_interest", city))
         except Exception as exc:  # noqa: BLE001
