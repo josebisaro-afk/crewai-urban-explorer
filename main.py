@@ -371,6 +371,19 @@ def _run_pipeline_for_city(job: CityJob, want_hiker: bool) -> dict:
         )
         discovery_output = _fetch_existing_content_as_discovery_output(city)
         enrichment_output: dict = {}
+        # Aunque haya lugares, faltan restaurantes y agenda: los buscadores
+        # de negocios y de eventos trabajan igual (datos reales de
+        # OpenStreetMap / fuentes con fecha), sin rehacer los lugares.
+        _set_city_status(city, "discovery", "running")
+        try:
+            fresh = DiscoveryCrew(job).kickoff(only=("events", "businesses"))
+            discovery_output["new_events"] = fresh.get("events", "[]")
+            discovery_output["new_businesses"] = fresh.get("businesses", "[]")
+            _set_city_status(city, "discovery", "done")
+        except Exception as exc:  # noqa: BLE001
+            _set_city_status(city, "discovery", "error")
+            errors.append(f"discovery(eventos/negocios): {exc}")
+            logger.exception("Slim DiscoveryCrew failed for %s", city)
 
         def run_content() -> None:
             nonlocal content_result

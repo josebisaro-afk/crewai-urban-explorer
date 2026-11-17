@@ -94,19 +94,22 @@ class DiscoveryCrew:
         self.job = job
         self.language = language_for_country(job.country)
 
-    def kickoff(self) -> dict:
+    def kickoff(self, only: tuple[str, ...] | None = None) -> dict:
+        """only=("events", "businesses") corre solo esos buscadores — se usa
+        cuando la ciudad ya tiene lugares (los puso poi-discovery) pero
+        todavía le faltan restaurantes y agenda."""
         j = self.job
-        agents = {
-            "pois": d_pois_agent.create_agent(),
-            "events": d_events_agent.create_agent(),
-            "businesses": d_biz_agent.create_agent(),
-            "weather": d_weather_agent.create_agent(),
+        factories = {
+            "pois": (d_pois_agent, d_pois_task),
+            "events": (d_events_agent, d_events_task),
+            "businesses": (d_biz_agent, d_biz_task),
+            "weather": (d_weather_agent, d_weather_task),
         }
+        keys = [k for k in factories if only is None or k in only]
+        agents = {k: factories[k][0].create_agent() for k in keys}
         tasks: dict[str, Task] = {
-            "pois": d_pois_task.create_task(agents["pois"], j.city, j.country or "", j.lat, j.lng, self.language),
-            "events": d_events_task.create_task(agents["events"], j.city, j.country or "", j.lat, j.lng, self.language),
-            "businesses": d_biz_task.create_task(agents["businesses"], j.city, j.country or "", j.lat, j.lng, self.language),
-            "weather": d_weather_task.create_task(agents["weather"], j.city, j.country or "", j.lat, j.lng, self.language),
+            k: factories[k][1].create_task(agents[k], j.city, j.country or "", j.lat, j.lng, self.language)
+            for k in keys
         }
         crew = Crew(agents=list(agents.values()), tasks=list(tasks.values()), process=Process.sequential, verbose=True)
         crew.kickoff()

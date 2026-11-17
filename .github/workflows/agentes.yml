@@ -1,0 +1,85 @@
+name: Agentes Urban Explorer
+
+# Los 20 agentes trabajan solos, sin servidor:
+#  - cada 2 horas miran si hay ciudades pendientes (si no hay, terminan en segundos);
+#  - también se pueden lanzar a mano desde la pestaña "Actions" (Run workflow).
+on:
+  schedule:
+    - cron: "23 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      city:
+        description: "Ciudad concreta (vacío = las de la cola)"
+        required: false
+        default: ""
+      max_cities:
+        description: "Máximo de ciudades en esta corrida (1-5)"
+        required: false
+        default: "2"
+      hiker:
+        description: "Incluir el equipo de senderismo"
+        type: boolean
+        default: false
+
+# Nunca dos corridas a la vez (evita trabajo y gasto duplicados).
+concurrency:
+  group: agentes-urban
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  agentes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SUPABASE_URL: https://wqsdtdvkqssjjucwjxgv.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      INPUT_CITY: ${{ github.event.inputs.city }}
+      INPUT_MAX: ${{ github.event.inputs.max_cities }}
+      INPUT_HIKER: ${{ github.event.inputs.hiker }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Comprobar secretos
+        run: |
+          if [ -z "$SUPABASE_SERVICE_ROLE_KEY" ] || [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::Faltan los secretos SUPABASE_SERVICE_ROLE_KEY y/o ANTHROPIC_API_KEY en Settings > Secrets > Actions"
+            exit 1
+          fi
+
+      - name: ¿Hay ciudades pendientes?
+        id: cola
+        run: |
+          if [ -n "$INPUT_CITY" ]; then echo "hay=1" >> "$GITHUB_OUTPUT"; exit 0; fi
+          n=$(curl -sS --fail -X POST "$SUPABASE_URL/rest/v1/rpc/agent_next_cities" \
+                -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "Content-Type: application/json" \
+                -d '{"p_limit":1}' | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))')
+          echo "Ciudades pendientes (muestra): $n"
+          echo "hay=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Descargar el código
+        if: steps.cola.outputs.hay != '0'
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        if: steps.cola.outputs.hay != '0'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Instalar dependencias
+        if: steps.cola.outputs.hay != '0'
+        run: pip install -r requirements.txt
+
+      - name: Agentes trabajando
+        if: steps.cola.outputs.hay != '0'
+        run: |
+          ARGS=(--max "${INPUT_MAX:-2}")
+          if [ -n "$INPUT_CITY" ]; then ARGS+=(--city "$INPUT_CITY"); fi
+          if [ "$INPUT_HIKER" = "true" ]; then ARGS+=(--hiker); fi
+          python run_job.py "${ARGS[@]}"

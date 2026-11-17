@@ -5,8 +5,11 @@ from supabase import create_client, Client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-CREWAI_INGEST_SECRET = os.environ["CREWAI_INGEST_SECRET"]
-CREWAI_KICKOFF_TOKEN = os.environ["CREWAI_KICKOFF_TOKEN"]
+# En GitHub Actions solo hay dos secretos (service role + Anthropic): si no
+# hay secreto propio de ingesta, agent-content-ingest acepta la service role.
+CREWAI_INGEST_SECRET = os.environ.get("CREWAI_INGEST_SECRET") or SUPABASE_SERVICE_ROLE_KEY
+# Solo lo usa el servidor FastAPI (main.py); el job de GitHub no lo necesita.
+CREWAI_KICKOFF_TOKEN = os.environ.get("CREWAI_KICKOFF_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 AGENT_CONTENT_INGEST_URL = f"{SUPABASE_URL}/functions/v1/agent-content-ingest"
@@ -36,9 +39,11 @@ COUNTRY_LANGUAGE = {
 
 
 def language_for_country(country: str | None) -> str:
+    # Los usuarios de la app hablan español: si el país no está en la lista
+    # (Hungría, Eslovaquia…), el contenido va en español, no en inglés.
     if not country:
         return "es"
-    return COUNTRY_LANGUAGE.get(country.strip().lower(), "en")
+    return COUNTRY_LANGUAGE.get(country.strip().lower(), "es")
 
 
 # Categories agent-content-ingest actually accepts — mirrors

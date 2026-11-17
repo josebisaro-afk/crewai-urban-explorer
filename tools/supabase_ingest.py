@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from config import AGENT_CONTENT_INGEST_URL, CREWAI_INGEST_SECRET, VALID_CATEGORIES
 
 MAX_ITEMS_PER_REQUEST = 50
+FOOD_CATEGORIES = {"restaurant", "bar", "gastronomy"}
 REQUEST_TIMEOUT_S = 30.0
 
 
@@ -83,6 +84,27 @@ class SupabaseIngestTool(BaseTool):
                 for r in result.get("results", []):
                     if not r.get("ok"):
                         errors.append(f"{r.get('key')}: {r.get('error')}")
+
+        # Restaurantes y bares con coordenadas también van como lugares del
+        # mapa: la app arma su sección "Restaurantes" con esos lugares.
+        if type == "business":
+            food = [
+                {k: v for k, v in {
+                    "city": it.get("city"), "country": it.get("country"),
+                    "name": it.get("name"), "category": it.get("category"),
+                    "lat": it.get("lat"), "lng": it.get("lng"),
+                    "address": it.get("address"),
+                    "description_es": it.get("description"),
+                }.items() if v not in (None, "")}
+                for it in items
+                if it.get("category") in FOOD_CATEGORIES
+                and isinstance(it.get("lat"), (int, float)) and isinstance(it.get("lng"), (int, float))
+            ]
+            with httpx.Client(timeout=REQUEST_TIMEOUT_S) as client:
+                for start in range(0, len(food), MAX_ITEMS_PER_REQUEST):
+                    result = self._post_with_retry(client, "poi", food[start:start + MAX_ITEMS_PER_REQUEST])
+                    if "error" in result:
+                        errors.append(f"poi(restaurantes): {result['error']}")
 
         summary = (
             f"[{location or type}] inserted={total_inserted} "
