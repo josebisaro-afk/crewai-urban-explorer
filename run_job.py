@@ -24,7 +24,7 @@ import httpx
 import sys
 from datetime import datetime, timezone
 
-from config import supabase
+from config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL, supabase
 from schemas import CityJob
 
 # main.py trae el pipeline y los helpers de city_cache. Importarlo crea la
@@ -91,19 +91,45 @@ def _business_total(city: str) -> int:
     return main._count_table_rows("businesses", city)
 
 
+def _places_enrich(city: str) -> int:
+    """Restaurantes, cafés y bares reales desde Google Places (función
+    places-enrich de Supabase). Devuelve cuántos sitios nuevos o mejorados
+    guardó; 0 si no hay clave de Google configurada o si falla."""
+    try:
+        r = httpx.post(
+            f"{SUPABASE_URL}/functions/v1/places-enrich",
+            json={"city": city},
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            },
+            timeout=150,
+        )
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        logger.info("Google Places %s: HTTP %s %s", city, r.status_code, data)
+        if r.status_code != 200:
+            return 0
+        return int(data.get("inserted") or 0) + int(data.get("enriched") or 0)
+    except Exception:  # noqa: BLE001
+        logger.warning("Google Places falló para %s", city)
+        return 0
+
+
 def run(jobs: list[CityJob], want_hiker: bool) -> int:
     failed = 0
     for job in jobs:
-        had_business = _business_total(job.city) > 0
-        job.country = _country_for(job)
-        logger.info("=== Agentes trabajando en %s (%s) ===", job.city, job.country or "país desconocido")
-        _claim(job.city, job.country)
         try:
+            had_business = _business_total(job.city) > 0
+            job.country = _country_for(job)
+            logger.info("=== Agentes trabajando en %s (%s) ===", job.city, job.country or "país desconocido")
+            _claim(job.city, job.country)
             result = main._run_pipeline_for_city(job, want_hiker)
+            places_saved = _places_enrich(job.city)
             # Ciudad sin negocios que sigue sin negocios: los agentes no
             # lograron guardar nada. Se marca error para que la cola lo
             # reintente (antes quedaba "complete" vacía durante 30 días).
-            if result["status"] != "error" and not had_business and _business_total(job.city) == 0:
+            if (result["status"] != "error" and not had_business
+                    and _business_total(job.city) == 0 and places_saved == 0):
                 result["status"] = "error"
                 result.setdefault("errors", []).append("los agentes terminaron pero no se guardó nada nuevo")
             main._finalize_city_cache(result)
@@ -113,7 +139,10 @@ def run(jobs: list[CityJob], want_hiker: bool) -> int:
                 failed += 1
         except Exception:  # noqa: BLE001
             logger.exception("Fallo inesperado en %s", job.city)
-            main._set_city_cache_status(job.city, "error", error_message="fallo inesperado en run_job")
+            try:
+                main._set_city_cache_status(job.city, "error", error_message="fallo inesperado en run_job")
+            except Exception:  # noqa: BLE001
+                logger.exception("Tampoco pude marcar el error de %s", job.city)
             failed += 1
         finally:
             main._reap_leaked_threads(job.city)
