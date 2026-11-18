@@ -17,6 +17,7 @@ Uso:
   python run_job.py --city "Košice" --hiker
 """
 import argparse
+import hashlib
 import logging
 import time
 
@@ -91,6 +92,27 @@ def _business_total(city: str) -> int:
     return main._count_table_rows("businesses", city)
 
 
+def _content_signature(city: str) -> str | None:
+    """Huella (hash) del contenido de la ciudad: lugares con su nombre, texto y
+    dato curioso, y negocios con nombre y descripción. Si no cambia, los
+    agentes no guardaron nada. Antes solo se miraban los negocios y se
+    marcaba error aunque hubieran mejorado los lugares. None = no se pudo
+    medir (entonces no se marca error por esto)."""
+    try:
+        pois = (supabase.table("points_of_interest").select("id,name,description_es,fun_fact")
+                .eq("city", city).execute().data or [])
+        biz = (supabase.table("businesses").select("id,name,description")
+               .eq("city", city).execute().data or [])
+        parts = sorted(
+            [f"p|{r.get('id')}|{r.get('name')}|{r.get('description_es')}|{r.get('fun_fact')}" for r in pois]
+            + [f"b|{r.get('id')}|{r.get('name')}|{r.get('description')}" for r in biz]
+        )
+        return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    except Exception:  # noqa: BLE001
+        logger.warning("No pude medir el contenido de %s", city)
+        return None
+
+
 def _places_enrich(city: str) -> int:
     """Restaurantes, cafés y bares reales desde Google Places (función
     places-enrich de Supabase). Devuelve cuántos sitios nuevos o mejorados
@@ -119,7 +141,7 @@ def run(jobs: list[CityJob], want_hiker: bool) -> int:
     failed = 0
     for job in jobs:
         try:
-            had_business = _business_total(job.city) > 0
+            before = _content_signature(job.city)
             job.country = _country_for(job)
             logger.info("=== Agentes trabajando en %s (%s) ===", job.city, job.country or "país desconocido")
             _claim(job.city, job.country)
@@ -128,8 +150,10 @@ def run(jobs: list[CityJob], want_hiker: bool) -> int:
             # Ciudad sin negocios que sigue sin negocios: los agentes no
             # lograron guardar nada. Se marca error para que la cola lo
             # reintente (antes quedaba "complete" vacía durante 30 días).
-            if (result["status"] != "error" and not had_business
-                    and _business_total(job.city) == 0 and places_saved == 0):
+            after = _content_signature(job.city)
+            logger.info("Contenido %s antes %s / después %s", job.city, before, after)
+            if (result["status"] != "error" and places_saved == 0
+                    and before is not None and after == before):
                 result["status"] = "error"
                 result.setdefault("errors", []).append("los agentes terminaron pero no se guardó nada nuevo")
             main._finalize_city_cache(result)
