@@ -6,6 +6,7 @@ viewpoints, nightlife...) so each specialist agent can search the specific
 tags relevant to its own domain.
 """
 import math
+import time
 from typing import Type
 
 import httpx
@@ -20,7 +21,12 @@ OVERPASS_MIRRORS = (
     "https://overpass.private.coffee/api/interpreter",
 )
 USER_AGENT = "UrbanExplorerAI-CrewAI/1.0 (content research agent)"
-REQUEST_TIMEOUT_S = 25.0
+REQUEST_TIMEOUT_S = 12.0
+# Si todos los servidores fallan, no se vuelve a intentar durante 30 min:
+# antes los agentes repetían la búsqueda 8-10 veces seguidas (minutos y
+# dinero tirados) cuando Overpass no respondía desde GitHub.
+_DOWN_FOR_S = 1800
+_down_until = 0.0
 
 
 def _bbox_from_radius(lat: float, lng: float, radius_m: float) -> tuple[float, float, float, float]:
@@ -56,6 +62,10 @@ class OverpassPOITool(BaseTool):
     args_schema: Type[BaseModel] = OverpassPOIInput
 
     def _run(self, lat: float, lng: float, tags: list[str], radius_m: int = 6000, limit: int = 25) -> str:
+        global _down_until
+        if time.monotonic() < _down_until:
+            return ("OVERPASS NO DISPONIBLE ahora. No vuelvas a usar esta herramienta en esta tarea: "
+                    "trabajá solo con la información que ya tenés y no inventes sitios ni coordenadas.")
         south, west, north, east = _bbox_from_radius(lat, lng, radius_m)
         clauses = []
         for tag in tags:
@@ -90,7 +100,9 @@ class OverpassPOITool(BaseTool):
                 last_error = str(exc)
                 res = None
         if res is None:
-            return f"ERROR: Overpass request failed on all servers: {last_error}"
+            _down_until = time.monotonic() + _DOWN_FOR_S
+            return (f"ERROR: Overpass no responde ({last_error[:80]}). OVERPASS NO DISPONIBLE: no vuelvas a "
+                    "usar esta herramienta en esta tarea; trabajá con lo que ya tenés y no inventes sitios.")
 
         elements = res.json().get("elements", [])[:limit]
         if not elements:
