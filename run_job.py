@@ -137,6 +137,26 @@ def _places_enrich(city: str) -> int:
         return 0
 
 
+def _place_research(city: str) -> int:
+    """Buscador de pueblos (función place-research de Supabase): si la ciudad
+    tiene pocos lugares, la IA busca en internet sus imprescindibles con
+    fuente y los comprueba en el mapa. Corre en Supabase, así que no le
+    afectan los bloqueos de Wikipedia/OpenStreetMap a GitHub."""
+    try:
+        r = httpx.post(
+            f"{SUPABASE_URL}/functions/v1/place-research",
+            json={"city": city},
+            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_SERVICE_ROLE_KEY},
+            timeout=150,
+        )
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        logger.info("Buscador de pueblos %s: HTTP %s %s", city, r.status_code, data)
+        return int(data.get("inserted") or 0) if r.status_code == 200 else 0
+    except Exception:  # noqa: BLE001
+        logger.warning("Buscador de pueblos falló para %s", city)
+        return 0
+
+
 def run(jobs: list[CityJob], want_hiker: bool) -> int:
     failed = 0
     for job in jobs:
@@ -145,8 +165,9 @@ def run(jobs: list[CityJob], want_hiker: bool) -> int:
             job.country = _country_for(job)
             logger.info("=== Agentes trabajando en %s (%s) ===", job.city, job.country or "país desconocido")
             _claim(job.city, job.country)
+            researched = _place_research(job.city)
             result = main._run_pipeline_for_city(job, want_hiker)
-            places_saved = _places_enrich(job.city)
+            places_saved = _places_enrich(job.city) + researched
             # Ciudad sin negocios que sigue sin negocios: los agentes no
             # lograron guardar nada. Se marca error para que la cola lo
             # reintente (antes quedaba "complete" vacía durante 30 días).
